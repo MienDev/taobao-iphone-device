@@ -5,35 +5,31 @@
 
 import argparse
 import base64
-import datetime
-import fnmatch
 import json
 import logging
 import os
 import re
-import shutil
-import socket
 import subprocess
 import sys
-import threading
 import time
-import traceback
 from collections import defaultdict
 from pprint import pformat, pprint
 from typing import Optional, Union
+from datetime import datetime
 
-import colored
 import requests
 from logzero import setup_logger
 
-from ._wdaproxy import WDAService
 from ._device import Device
+from ._imagemounter import cache_developer_image
 from ._ipautil import IPAReader
-from ._proto import MODELS, PROGRAM_NAME, LOG
+from ._perf import DataType
+from ._proto import LOG, MODELS, PROGRAM_NAME
 from ._relay import relay
 from ._usbmux import Usbmux
 from ._utils import get_app_dir, get_binary_by_name, is_atty
 from ._version import __version__
+from ._wdaproxy import WDAService
 from .exceptions import MuxError, MuxServiceError, ServiceError
 
 um = None  # Usbmux
@@ -44,20 +40,20 @@ def _complete_udid(udid: Optional[str] = None) -> str:
     infos = um.device_list()
     if not udid:
         if len(infos) >= 2:
-            sys.exit("More then 2 devices detected")
+            sys.exit("More than 2 devices detected")
         if len(infos) == 0:
             sys.exit("No device detected")
-        return infos[0]['SerialNumber']
+        return infos[0].udid
 
     # Find udid exactly match
     for info in infos:
-        if info['SerialNumber'] == udid:
+        if info.udid == udid:
             return udid
 
     # Find udid starts-with
     _udids = [
-        info['SerialNumber'] for info in infos
-        if info['SerialNumber'].startswith(udid)
+        info.udid for info in infos
+        if info.udid.startswith(udid)
     ]
 
     if len(_udids) == 1:
@@ -80,12 +76,15 @@ def cmd_list(args: argparse.Namespace):
 
     result = []
     for dinfo in um.device_list():
-        udid = dinfo['SerialNumber']
-        _d = Device(udid, um)
-        name = _d.name
-        if not args.json:
-            print(udid, name)
-        result.append(dict(udid=udid, name=name))
+        udid, conn_type = dinfo.udid, dinfo.conn_type
+        try:
+            _d = Device(udid, um)
+            name = _d.name
+            if not args.json:
+                print(udid, name, conn_type)
+        except MuxError:
+            name = ""
+        result.append(dict(udid=udid, name=name, conn_type=conn_type))
     if args.json:
         _print_json(result)
 
@@ -121,6 +120,16 @@ def cmd_device_info(args: argparse.Namespace):
             print("{:17s} {}".format(attr + ":", value.get(attr)))
 
 
+def cmd_date(args: argparse.Namespace):
+    d = _udid2device(args.udid)
+    value = d.get_value() or {}
+    timestamp = value.get("TimeIntervalSince1970")
+    if args.format:
+        print(datetime.fromtimestamp(int(timestamp)))
+    else:
+        print(timestamp)
+
+
 def cmd_version(args: argparse.Namespace):
     print(PROGRAM_NAME, "version", __version__)
 
@@ -153,6 +162,7 @@ def cmd_shutdown(args: argparse.Namespace):
 
 def cmd_parse(args: argparse.Namespace):
     uri = args.uri
+    _all = args.all
 
     fp = None
     if re.match(r"^https?://", uri):
@@ -172,7 +182,7 @@ def cmd_parse(args: argparse.Namespace):
 
     try:
         ir = IPAReader(fp)
-        ir.dump_info()
+        ir.dump_info(all=_all)
     finally:
         fp.close()
 
@@ -219,7 +229,7 @@ def cmd_xctest(args: argparse.Namespace):
 
     d = _udid2device(args.udid)
     env = {}
-    for kv in args.env or {}:
+    for kv in args.env or []:
         key, val = kv.split(":", 1)
         env[key] = val
     if env:
@@ -309,8 +319,18 @@ def cmd_battery(args: argparse.Namespace):
 
 
 def cmd_developer(args: argparse.Namespace):
-    d = _udid2device(args.udid)
-    d.mount_developer_image()
+    if args.download_all:
+        for major in range(7, 15):
+            for minor in range(0, 10):
+                version = f"{major}.{minor}"
+                try:
+                    cache_developer_image(version)
+                except requests.HTTPError:
+                    break
+        #     print("finish cache developer image {}".format(version))
+    else:
+        d = _udid2device(args.udid)
+        d.mount_developer_image()
     return
 
 
@@ -322,8 +342,17 @@ def cmd_relay(args: argparse.Namespace):
 def cmd_wdaproxy(args: argparse.Namespace):
     """ start xctest and relay """
     d = _udid2device(args.udid)
+    
+    env = {}
+    for kv in args.env or []:
+        key, val = kv.split(":", 1)
+        env[key] = val
+    if env:
+        logger.info("Launch env: %s", env)
+    
+    serv = WDAService(d, args.bundle_id, env)
+    serv.set_check_interval(args.check_interval)
 
-    serv = WDAService(d, args.bundle_id)
     p = None
     if args.port:
         cmds = [
@@ -334,7 +363,7 @@ def cmd_wdaproxy(args: argparse.Namespace):
 
     try:
         serv.start()
-        while serv._service.running:
+        while serv._service.running and p.poll() is None:
             time.sleep(.1)
     finally:
         p and p.terminate()
@@ -417,8 +446,63 @@ def cmd_fsync(args: argparse.Namespace):
         raise NotImplementedError()
 
 
-def cmd_test(args: argparse.Namespace):
+def cmd_ps(args: argparse.Namespace):
+    d = _udid2device(args.udid)
+    app_infos = list(d.installation.iter_installed(app_type=None))
+    ps = list(d.instruments.app_process_list(app_infos))
 
+    lens = defaultdict(int)
+    json_data = []
+    keys = ['pid', 'name', 'bundle_id', 'display_name']
+    for p in ps:
+        if not args.all and not p['isApplication']:
+            continue
+        for key in keys:
+            lens[key] = max(lens[key], len(str(p[key])))
+        json_data.append({key: p[key] for key in keys})
+
+    if args.json:
+        _print_json(json_data)
+        return
+
+    # {:0} is not allowed, so max(1, xx) is necessary
+    fmt = ' '.join(['{:%d}' % max(1, lens[key]) for key in keys])
+    fmt = '{:>' + fmt[2:]  # set PID right align
+    if is_atty:
+        print(fmt.format(*[key.upper() for key in keys]))
+
+    for p in ps:
+        if not args.all and not p['isApplication']:
+            continue
+        print(fmt.format(*[p[key] for key in keys]))
+
+
+def cmd_perf(args: argparse.Namespace):
+    assert args.bundle_id
+    #print("BundleID:", args.bundle_id)
+    from ._perf import Performance
+    d = _udid2device(args.udid)
+    perfs = list(DataType)
+    if args.perfs:
+        perfs = []
+        for _typename in args.perfs.split(","):
+            perfs.append(DataType(_typename))
+    # print(perfs)
+    perf = Performance(d, perfs=perfs)
+
+    def _cb(_type: DataType, data):
+        print(_type.value, data)
+
+    try:
+        perf.start(args.bundle_id, callback=_cb)
+        #print("Ctrl-C to finish")
+        while True:
+            time.sleep(.1)
+    finally:
+        perf.stop()
+
+
+def cmd_test(args: argparse.Namespace):
     print("Just test")
     # files = os.listdir(path)
 
@@ -458,6 +542,14 @@ _commands = [
             dict(args=['--domain'], help='set domain of query to NAME.'),
         ],
         help="show device info"),
+    dict(action=cmd_date,
+         command="date",
+         flags=[
+             dict(args=['--format'],
+                  action='store_true',
+                  help="format timestamp")
+         ],
+         help="device current date"),
     dict(action=cmd_system_info,
          command="sysinfo",
          help="show device system info"),
@@ -500,7 +592,8 @@ _commands = [
     dict(action=cmd_shutdown, command="shutdown", help="shutdown device"),
     dict(action=cmd_parse,
          command="parse",
-         flags=[dict(args=['uri'], help="local path or url")],
+         flags=[dict(args=['--all'], action='store_true', help='show all info'),
+                dict(args=['uri'], help="local path or url")],
          help="parse ipa bundle id"),
     dict(action=cmd_watch, command="watch", help="watch device"),
     dict(action=cmd_wait_for_device,
@@ -520,6 +613,17 @@ _commands = [
          command="kill",
          flags=[dict(args=['name'], help='pid or bundle_id')],
          help="kill by pid or bundle_id"),
+    dict(action=cmd_ps,
+         command="ps",
+         flags=[
+             dict(args=['--json'],
+                  action='store_true',
+                  help='format output as json'),
+             dict(args=['-A', '--all'],
+                  action='store_true',
+                  help='show all process')
+         ],
+         help="show running processes"),
     dict(action=cmd_relay,
          command="relay",
          flags=[
@@ -557,7 +661,12 @@ _commands = [
              dict(args=['-p', '--port'],
                   type=int,
                   default=8100,
-                  help='pc listen port, set to 0 to disable port forward')
+                  help='pc listen port, set to 0 to disable port forward'),
+             dict(args=['-e', '--env'],
+                  action='append',
+                  help="set env with format key:value, support multi -e"),
+             dict(args=['--check-interval'], type=float, default=30.0,
+                  help="check if wda is alive every CHECK_INTERVAL seconds, stop check when set to 0"),
          ],
          help='keep WDA running and relay WDA service to pc'),
     dict(action=cmd_syslog, command='syslog', help="print iphone syslog"),
@@ -576,8 +685,14 @@ _commands = [
     dict(action=cmd_dump_fps, command='dumpfps', help='dump fps'),
     dict(action=cmd_developer,
          command="developer",
+         flags=[dict(args=['--download-all'], action="store_true", help="download all developer to local")],
          help="mount developer image to device"),
     dict(action=cmd_pair, command='pair', help='pair device'),
+    dict(action=cmd_perf,
+         command="perf",
+         flags=[dict(args=['-B', '--bundle_id'], help='app bundle id', required=True),
+                dict(args=['-o'], dest='perfs', help='cpu,memory,fps,network,screenshot. separate by ","', required=False),],
+         help="performance of app"),
     dict(action=cmd_test, command="test", help="command for developer"),
 ]
 
